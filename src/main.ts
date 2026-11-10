@@ -1,180 +1,256 @@
-import * as THREE from 'three';
-import { AudioBed } from './core/audio';
-import { FollowCamera } from './core/camera';
-import { DebugPanel } from './core/debug';
-import { bus } from './core/events';
-import { Input } from './core/input';
-import { startLoop } from './core/loop';
-import { QUALITY, QUALITY_ORDER, detectQuality, type QualityName } from './core/quality';
-import { createRenderer, effectivePixelRatio } from './core/renderer';
-import { Rng } from './core/rng';
-import { saveSettings, settings } from './core/store';
-import { Player } from './entities/player';
-import { buildAtmosphere, installHeightFog } from './fx/atmosphere';
-import { WetGround } from './fx/ground';
-import { Post } from './fx/post';
-import { Rain } from './fx/rain';
-import { Hud } from './ui/hud';
-import { LightPool } from './world/lights';
-import { ROAD_HALF, buildStreet, groundY } from './world/street';
+import { DRUMS, DrumKit } from './audio/drums';
+import { Engine } from './audio/engine';
+import { PATCHES } from './audio/patches';
+import { Recorder } from './audio/recorder';
+import { Synth, type Held } from './audio/synth';
+import { Sequencer } from './seq';
+import { ROOTS, ROWS, SCALES, degreeToMidi, demo, empty, load, save, type Project } from './state';
+import { h, select, slider } from './ui/dom';
+import { drumGrid } from './ui/drumgrid';
+import { pianoRoll } from './ui/roll';
 
-const params = new URLSearchParams(location.search);
-const debug = params.has('debug');
-const seed = Number(params.get('seed') ?? 1337) || 1337;
+const engine = new Engine();
+let project: Project = load();
+const kit = new DrumKit(engine);
+const synths = PATCHES.map((p, i) => new Synth(engine, p, project.tracks[i]!));
+const seq = new Sequencer(engine, kit, synths, project);
+const rec = new Recorder(engine);
+const app = document.getElementById('app')!;
 
-const canvas = document.getElementById('game') as HTMLCanvasElement;
-const ui = document.getElementById('ui') as HTMLElement;
-const renderer = createRenderer(canvas);
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
+let selected = 0;
+let capture = false;
+let keyShift = 0;
+let playheads: ((step: number) => void)[] = [];
+let redrawRoll = (): void => undefined;
+const takes: { url: string; name: string; seconds: number }[] = [];
 
-const qParam = params.get('q') as QualityName | null;
-let qName: QualityName =
-  qParam && qParam in QUALITY ? qParam : settings.quality === 'auto' ? detectQuality(renderer.getContext()) : settings.quality;
-let quality = QUALITY[qName];
+const playBtn = h('button', { class: 'btn play', onclick: () => togglePlay() }, '▶ Play');
+const recBtn = h('button', { class: 'btn rec', onclick: () => void toggleRec() }, '● Rec');
+const scope = h('canvas', { class: 'scope', width: 260, height: 54 });
+const takesEl = h('div', { class: 'takes' });
+const body = h('div', { class: 'body' });
 
-// World
-installHeightFog();
-buildAtmosphere(scene);
-const wet = new WetGround(ROAD_HALF);
-const street = buildStreet(seed, wet);
-scene.add(street.group);
-const rainRng = new Rng(seed ^ 0x9e37);
-const rain = new Rain(ROAD_HALF, () => rainRng.next());
-scene.add(rain.streaks, rain.splashes);
-wet.hide.push(...street.ground, rain.streaks, rain.splashes);
-const lights = new LightPool(scene, street.sources, quality.lights);
-
-const player = new Player();
-player.teleport(8.6, 70, groundY(8.6));
-scene.add(player.group);
-const follow = new FollowCamera(camera);
-
-const input = new Input(canvas);
-const audio = new AudioBed();
-const post = new Post(renderer, scene, camera, quality);
-const panel = new DebugPanel(debug, ui);
-const hud = new Hud(
-  ui,
-  () => {
-    input.requestLock();
-    audio.start(settings.volume);
-  },
-  debug || params.has('autostart'),
-);
-canvas.addEventListener('click', () => {
-  if (!hud.started) return;
-  input.requestLock();
-  audio.start(settings.volume);
-});
-bus.on('footstep', ({ run }) => audio.footstep(run));
-bus.on('toast', () => audio.blip());
-
-function resize(): void {
-  const w = window.innerWidth;
-  const h = window.innerHeight;
-  const pr = effectivePixelRatio(quality);
-  renderer.setPixelRatio(pr);
-  renderer.setSize(w, h, false);
-  post.setSize(w, h);
-  wet.setQuality(quality.reflScale, w * pr, h * pr);
-  camera.aspect = w / h;
-  camera.far = quality.far;
-  camera.updateProjectionMatrix();
+function togglePlay(): void {
+  if (seq.playing) seq.stop();
+  else seq.start();
+  playBtn.textContent = seq.playing ? '■ Stop' : '▶ Play';
+  playBtn.classList.toggle('on', seq.playing);
 }
-window.addEventListener('resize', resize);
 
-function applyQuality(name: QualityName, persist: boolean): void {
-  qName = name;
-  quality = QUALITY[name];
-  post.build(quality);
-  lights.resize(quality.lights);
-  rain.setCounts(quality.rainCount * settings.rain, quality.splashCount * settings.rain);
-  resize();
-  if (persist) {
-    settings.quality = name;
-    saveSettings();
+async function toggleRec(): Promise<void> {
+  engine.resume();
+  if (!rec.recording) {
+    await rec.start();
+    if (!seq.playing) togglePlay();
+    recBtn.classList.add('on');
+    return;
   }
-  bus.emit('quality', { name });
+  const take = rec.stop();
+  recBtn.classList.remove('on');
+  recBtn.textContent = '● Rec';
+  if (!take) return;
+  takes.unshift({ url: URL.createObjectURL(take.blob), name: `drizzle-take-${takes.length + 1}.wav`, seconds: take.seconds });
+  renderTakes();
 }
 
-let time = 0;
-function update(dt: number): void {
-  time += dt;
-  QUALITY_ORDER.forEach((n, i) => {
-    if (!input.pressed(`Digit${i + 1}`)) return;
-    applyQuality(n, true);
-    bus.emit('toast', { text: `quality: ${n}` });
-  });
-  if (input.pressed('KeyV')) follow.first = !follow.first;
-  if (input.pressed('KeyM')) bus.emit('toast', { text: audio.toggleMute() ? 'muted' : 'sound on' });
-  if (hud.started) player.update(dt, input, follow.yaw, street.colliders, groundY);
-  lights.update(dt, player.pos.x, player.pos.z);
-  input.endStep();
-}
+const mmss = (s: number): string => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 
-function render(dt: number, alpha: number): void {
-  const l = input.look(dt);
-  follow.look(l.x, l.y);
-  player.render(alpha, dt);
-  follow.update(dt, player, street.colliders);
-  street.tick(time);
-  rain.update(time, camera);
-  renderer.info.reset();
-  wet.render(renderer, scene, camera, time);
-  post.render(dt);
-  panel.frame(
-    dt,
-    renderer,
-    () => `q     ${qName}\nseed  ${seed}\npos   ${player.pos.x.toFixed(1)}, ${player.pos.z.toFixed(1)}`,
+function renderTakes(): void {
+  takesEl.replaceChildren(
+    h('h2', {}, 'Takes'),
+    ...(takes.length
+      ? takes.map((t, i) =>
+          h('div', { class: 'take' },
+            h('span', { class: 'tname' }, `${t.name} · ${mmss(t.seconds)}`),
+            h('audio', { controls: true, src: t.url }),
+            h('a', { class: 'btn small', href: t.url, download: t.name }, '⬇ Download WAV'),
+            h('button', { class: 'btn small ghost', onclick: () => {
+              URL.revokeObjectURL(t.url);
+              takes.splice(i, 1);
+              renderTakes();
+            } }, 'Delete'),
+          ),
+        )
+      : [h('p', { class: 'hint' }, 'Press ● Rec to record everything you hear. Press it again to stop, then download the WAV here.')]),
   );
 }
 
-applyQuality(qName, false);
-startLoop(update, render);
-
-// Automation helpers (screenshots, tests). See scripts/screenshot.mjs.
-const game = {
-  ready: true,
-  seed,
-  scene,
-  camera,
-  renderer,
-  player,
-  follow,
-  lights,
-  setQuality: (n: QualityName) => applyQuality(n, false),
-  /** Free camera at a fixed pose. The light pool follows `focus` (defaults to the look target). */
-  setCam(px: number, py: number, pz: number, tx: number, ty: number, tz: number): void {
-    follow.free = true;
-    player.group.visible = true;
-    camera.position.set(px, py, pz);
-    camera.lookAt(tx, ty, tz);
-  },
-  /** Hand the camera back to the player. */
-  followCam(yaw = 0, pitch = 0.1): void {
-    follow.free = false;
-    follow.yaw = yaw;
-    follow.pitch = pitch;
-  },
-  teleport(x: number, z: number): void {
-    player.teleport(x, z, groundY(x));
-  },
-  shots: {
-    street: () => (game.teleport(3, 52), game.setCam(-1.5, 1.7, 62, 1, 7, 0)),
-    sidewalk: () => (game.teleport(8.2, 20), game.setCam(9.4, 1.75, 27, 5, 3.5, -20)),
-    puddle: () => (game.teleport(2, 4), game.setCam(-2.5, 0.45, 12, 1.5, 4, -30)),
-    high: () => (game.teleport(0, 40), game.setCam(-4, 38, 105, 2, 18, -30)),
-    player: () => (game.teleport(7.6, -20), game.followCam(0.3, 0.08)),
-  } as Record<string, () => void>,
-  shot(name: string): void {
-    game.shots[name]?.();
-  },
-  stats: () => ({ fps: +panel.fps.toFixed(1), ms: +panel.ms.toFixed(1), calls: panel.calls, tris: panel.tris, quality: qName }),
-};
-declare global {
-  interface Window {
-    __game: typeof game;
-  }
+function setProject(p: Project): void {
+  project = p;
+  seq.project = p;
+  synths.forEach((s, i) => {
+    s.params = p.tracks[i]!;
+    s.apply();
+  });
+  save(p);
+  render();
 }
-window.__game = game;
+
+function header(): HTMLElement {
+  const p = project;
+  const change = (fn: () => void, rebuild = false) => (): void => {
+    fn();
+    save(p);
+    if (rebuild) renderBody();
+  };
+  const cap = h('button', { class: `btn small ${capture ? 'on' : ''}`, title: 'While playing, notes you play on the keyboard are written into the pattern', onclick: () => {
+    capture = !capture;
+    cap.classList.toggle('on', capture);
+  } }, 'Capture keys');
+  return h('header', {},
+    h('div', { class: 'brand' }, h('h1', {}, 'DRIZZLE ', h('span', {}, 'SYNTH')), h('p', {}, 'neon house workstation')),
+    h('div', { class: 'transport' }, playBtn, recBtn, scope),
+    h('div', { class: 'globals' },
+      slider('Tempo', 80, 150, 1, p.bpm, (v) => change(() => {
+        p.bpm = v;
+        engine.setBpm(v);
+      })(), (v) => `${v} bpm`),
+      slider('Swing', 0, 0.6, 0.01, p.swing, (v) => change(() => (p.swing = v))(), (v) => `${Math.round(v * 100)}%`),
+      slider('Master', 0, 1, 0.01, p.master, (v) => change(() => {
+        p.master = v;
+        engine.setMaster(v);
+      })(), (v) => `${Math.round(v * 100)}%`),
+      select('Bars', ['1', '2', '4'], String(p.bars), (v) => change(() => (p.bars = Number(v)), true)()),
+      select('Key', ROOTS, ROOTS[p.root]!, (v) => change(() => (p.root = ROOTS.indexOf(v)), true)()),
+      select('Scale', Object.keys(SCALES), p.scale, (v) => change(() => (p.scale = v), true)()),
+      cap,
+      h('button', { class: 'btn small ghost', onclick: () => setProject(demo()) }, 'Load demo'),
+      h('button', { class: 'btn small ghost', onclick: () => confirm('Clear every pattern?') && setProject(empty()) }, 'Clear all'),
+    ),
+  );
+}
+
+function instrumentPanel(): HTMLElement {
+  const synth = synths[selected]!;
+  const t = synth.params;
+  const set = (fn: (v: number) => void) => (v: number): void => {
+    fn(v);
+    synth.apply();
+    save(project);
+  };
+  const tabs = h('div', { class: 'tabs' }, ...synths.map((s, i) =>
+    h('button', { class: `tab ${i === selected ? 'on' : ''}`, style: `--color:${s.patch.color}`, onclick: () => {
+      selected = i;
+      renderBody();
+    } }, h('b', {}, s.patch.name), h('small', {}, s.params.mute ? 'muted' : s.patch.hint)),
+  ));
+  const roll = pianoRoll(project, engine, synth);
+  playheads.push(roll.playhead);
+  redrawRoll = roll.redraw;
+  const lens: Record<string, number> = { '1/16': 1, '1/8': 2, '1/4': 4, '1/2': 8, '1 bar': 16 };
+  const mute = h('button', { class: `btn small ${t.mute ? 'on' : ''}`, onclick: () => {
+    t.mute = !t.mute;
+    synth.apply();
+    save(project);
+    renderBody();
+  } }, 'Mute');
+  const knobs = h('div', { class: 'knobs', style: `--color:${synth.patch.color}` },
+    slider('Volume', 0, 1.2, 0.01, t.vol, set((v) => (t.vol = v))),
+    slider('Cutoff', 0, 1, 0.001, Math.log(t.cutoff / 80) / Math.log(100), set((v) => (t.cutoff = 80 * 100 ** v)), (v) => `${Math.round(80 * 100 ** v)} Hz`),
+    slider('Resonance', 0.1, 12, 0.1, t.res, set((v) => (t.res = v)), (v) => v.toFixed(1)),
+    slider('Attack', 0.001, 1.5, 0.001, t.attack, set((v) => (t.attack = v)), (v) => `${v.toFixed(2)} s`),
+    slider('Release', 0.03, 3, 0.01, t.release, set((v) => (t.release = v)), (v) => `${v.toFixed(2)} s`),
+    slider('Reverb', 0, 1, 0.01, t.reverb, set((v) => (t.reverb = v))),
+    slider('Delay', 0, 1, 0.01, t.delay, set((v) => (t.delay = v))),
+    slider('Pump', 0, 0.9, 0.01, t.pump, set((v) => (t.pump = v))),
+    select('Draw length', Object.keys(lens), Object.keys(lens).find((k) => lens[k] === t.len) ?? '1/8', (v) => {
+      t.len = lens[v]!;
+      save(project);
+    }),
+    mute,
+    h('button', { class: 'btn small ghost', onclick: () => {
+      t.notes = [];
+      save(project);
+      roll.redraw();
+    } }, 'Clear notes'),
+  );
+  return h('section', { class: 'panel', style: `--color:${synth.patch.color}` }, h('h2', {}, 'Instruments'), tabs, knobs, roll.el,
+    h('p', { class: 'hint' }, 'Click the grid to draw or erase notes. Keyboard: A S D F G H J K L play notes, Q–P the octave above, Z / X shift octave, 1–8 drums, Space play/stop.'));
+}
+
+function renderBody(): void {
+  playheads = [];
+  const drums = drumGrid(project, engine, kit);
+  playheads.push(drums.playhead);
+  body.replaceChildren(h('section', { class: 'panel', style: '--color:#4df3ff' }, h('h2', {}, 'Drums'), drums.el), instrumentPanel(), takesEl);
+}
+
+function render(): void {
+  engine.setBpm(project.bpm);
+  engine.setMaster(project.master);
+  app.replaceChildren(header(), body);
+  renderBody();
+  renderTakes();
+}
+
+// Live keyboard: rows of keys map to scale degrees so you cannot hit a wrong note.
+const LOW = ['KeyA', 'KeyS', 'KeyD', 'KeyF', 'KeyG', 'KeyH', 'KeyJ', 'KeyK', 'KeyL', 'Semicolon', 'Quote'];
+const HIGH = ['KeyQ', 'KeyW', 'KeyE', 'KeyR', 'KeyT', 'KeyY', 'KeyU', 'KeyI', 'KeyO', 'KeyP'];
+const held = new Map<string, Held>();
+window.addEventListener('keydown', (ev) => {
+  const tag = (ev.target as HTMLElement).tagName;
+  if (tag === 'SELECT' || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if (ev.code === 'Space') {
+    ev.preventDefault();
+    if (!ev.repeat) togglePlay();
+    return;
+  }
+  if (ev.repeat) return;
+  engine.resume();
+  const n = (SCALES[project.scale] ?? SCALES.Minor!).length;
+  if (ev.code === 'KeyZ') keyShift = Math.max(0, keyShift - n);
+  if (ev.code === 'KeyX') keyShift = Math.min(n, keyShift + n);
+  const drum = /^Digit([1-8])$/.exec(ev.code);
+  if (drum) kit.trigger(Number(drum[1]) - 1, engine.ctx.currentTime + 0.005);
+  const lo = LOW.indexOf(ev.code);
+  const hi = HIGH.indexOf(ev.code);
+  if (lo < 0 && hi < 0) return;
+  const d = (lo >= 0 ? lo : hi + n) + keyShift;
+  if (d >= ROWS || held.has(ev.code)) return;
+  const synth = synths[selected]!;
+  held.set(ev.code, synth.play(degreeToMidi(project, synth.patch.baseMidi, d), engine.ctx.currentTime + 0.005));
+  if (capture && seq.playing && seq.current >= 0) {
+    const t = synth.params;
+    if (!t.notes.some((x) => x.s === seq.current && x.d === d)) t.notes.push({ s: seq.current, d, l: Math.min(t.len, seq.steps - seq.current) });
+    redrawRoll();
+    save(project);
+  }
+});
+window.addEventListener('keyup', (ev) => {
+  held.get(ev.code)?.release();
+  held.delete(ev.code);
+});
+window.addEventListener('blur', () => {
+  held.forEach((v) => v.release());
+  held.clear();
+});
+window.addEventListener('pointerdown', () => engine.resume());
+
+// Playhead, record timer and oscilloscope.
+const wave = new Uint8Array(engine.analyser.fftSize);
+const g = scope.getContext('2d')!;
+function frame(): void {
+  const step = seq.poll();
+  playheads.forEach((fn) => fn(step));
+  if (rec.recording) recBtn.textContent = `■ ${mmss(rec.elapsed())}`;
+  engine.analyser.getByteTimeDomainData(wave);
+  g.clearRect(0, 0, scope.width, scope.height);
+  g.strokeStyle = '#4df3ff';
+  g.shadowColor = '#4df3ff';
+  g.shadowBlur = 8;
+  g.lineWidth = 1.6;
+  g.beginPath();
+  for (let x = 0; x < scope.width; x++) {
+    const y = (wave[Math.floor((x / scope.width) * wave.length)]! / 255) * scope.height;
+    if (x) g.lineTo(x, y);
+    else g.moveTo(x, y);
+  }
+  g.stroke();
+  requestAnimationFrame(frame);
+}
+
+render();
+requestAnimationFrame(frame);
+
+// Handles for automated checks.
+Object.assign(window, { __synth: { engine, seq, rec, takes, drums: DRUMS, project: () => project } });

@@ -1,43 +1,37 @@
-# Neon Drizzle
+# Drizzle Synth
 
-A cozy cyberpunk exploration game for the browser. Always night, always raining.
-See `NEON_DRIZZLE_SPEC.md` for the full plan and `PROGRESS.md` for current status.
+A neon house workstation in the browser, built around the synth pad from the Neon Drizzle prototype.
+Everything is synthesised live with WebAudio: no samples, no dependencies.
 
 ## Run
 
 ```bash
 npm install
 npm run dev      # http://localhost:5173
-npm run build    # type-check + static bundle in dist/
+npm run build    # static bundle in dist/
 ```
+
+## What's in it
+
+- **Drizzle Pad** (the game's sound: two detuned saws, drifting low-pass, long delay), **Sub Bass**, **House Organ**, **Glass Pluck**, **Neon Lead**
+- **House drum kit**: kick, clap, snare, closed/open hat, shaker, rim, tom, on a 16-step-per-bar grid (1, 2 or 4 bars)
+- **Piano roll** per instrument, locked to the chosen key and scale
+- Per-instrument volume, cutoff, resonance, attack, release, reverb, delay and **pump** (sidechain ducking from the kick)
+- Tempo, swing, master volume
+- **Record** the master output to a 16-bit stereo WAV and download it
+- Patterns are saved in the browser automatically
 
 ## Controls
 
 | Input | Action |
 | --- | --- |
-| WASD / arrows / left stick | move |
-| Mouse / right stick | look (click the canvas to capture the mouse) |
-| Shift | run |
-| C | crouch |
-| V | toggle first / third person |
-| 1-4 | quality: low / medium / high / ultra |
-| M | mute |
-| Esc | release the mouse |
+| Space | play / stop |
+| A S D F G H J K L ; ' | play the selected instrument (scale notes) |
+| Q W E R T Y U I O P | the octave above |
+| Z / X | shift the keyboard down / up an octave |
+| 1-8 | drum pads |
+| Click a grid | draw or erase |
 
-## URL flags
+"Capture keys" writes what you play on the keyboard into the pattern while it loops.
 
-- `?debug` stats panel (fps, frame ms, draw calls, triangles), skips the start screen
-- `?seed=N` deterministic world
-- `?q=low|medium|high|ultra` force a quality preset
-- `?autostart` skip the start screen
-
-## Automation
-
-`window.__game` exposes helpers: `shot(name)`, `shots`, `setCam(px,py,pz,tx,ty,tz)`,
-`teleport(x,z)`, `setQuality(name)`, `stats()`.
-
-Screenshots at preset camera positions (needs the dev server running and Playwright available):
-
-```bash
-npm run shots -- --q medium --seed 7 --out screenshots
-```
+The game this grew out of is still in git history (commit `M1: one rainy neon street with a walking player`).
